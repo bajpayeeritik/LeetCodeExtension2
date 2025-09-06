@@ -1,34 +1,43 @@
-// service-worker.js - Integrated with Spring Boot backend
+// service-worker.js - Optimized Chrome Extension for LeetCode Session Tracking
 
 let isOnline = true;
 self.addEventListener('online', () => { isOnline = true; processRetryQueue(); });
 self.addEventListener('offline', () => { isOnline = false; });
 
+// Settings with defaults
 let settings = {
   userId: "user123",
-  leetcodeUsername: "",
-  backendUrl: "http://localhost:8082/api", // Your Spring Boot backend
-  apiKey: "", // Optional API key
+  leetcodeUsername: "bajpayeeritik_",
+  backendUrl: "http://localhost:8082/api/v1/problems",
+  apiKey: "",
   idleThresholdMs: 30000,
   heartbeatIntervalMs: 30000,
-  alfaApiBase: "https://alfa-leetcode-api.onrender.com"
+  alfaApiBase: "http://localhost:3000"
 };
 
+// Core data structures
 const sessions = new Map();
-const eventQueue = []; // Queue for offline events
+const eventQueue = [];
 let isProcessingQueue = false;
+
+// Timing controls - SEPARATED INTERVALS
+let lastHeartbeat = 0;
+let lastSubmissionCheck = 0;
+const HEARTBEAT_INTERVAL = 30000; // 30 seconds
+const SUBMISSION_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
 // Load settings on startup
 chrome.storage.sync.get({
   userId: 'user123',
   leetcodeUsername: '',
-  backendUrl: 'http://localhost:8080/api',
+  backendUrl: 'http://localhost:8082/api/v1/problems',
   apiKey: ''
 }).then(result => {
   Object.assign(settings, result);
   console.log('[bg] Settings loaded:', settings);
 });
 
+// Extract problem ID from URL
 function extractProblemId(url) {
   try {
     const parsed = new URL(url);
@@ -36,11 +45,13 @@ function extractProblemId(url) {
     if (pathParts.length >= 2 && pathParts[0] === 'problems') {
       return pathParts[1];
     }
-  } catch {}
+  } catch (e) {
+    console.warn('[bg] Error parsing URL:', e);
+  }
   return url?.slice(0, 20) || "unknown";
 }
 
-// Enhanced backend integration
+// Enhanced backend integration with retry logic
 async function postEvent(eventType, data) {
   const payload = {
     eventType,
@@ -53,7 +64,6 @@ async function postEvent(eventType, data) {
   console.log(`[bg:event] ${eventType}`, payload.data);
 
   if (!settings.backendUrl || !isOnline) {
-    // Queue event for later
     eventQueue.push(payload);
     console.log(`[bg] Queued event ${eventType} (offline or no backend)`);
     return false;
@@ -88,8 +98,10 @@ async function postEvent(eventType, data) {
     // Queue for retry
     eventQueue.push(payload);
     
-    // Try to process queue later
-    setTimeout(processRetryQueue, 30000);
+    // Delayed retry
+    if (!isProcessingQueue) {
+      setTimeout(processRetryQueue, 30000);
+    }
     return false;
   }
 }
@@ -115,7 +127,6 @@ async function processRetryQueue() {
       });
 
       if (!response.ok) {
-        // Put it back in queue for later
         eventQueue.unshift(payload);
         break;
       }
@@ -123,18 +134,17 @@ async function processRetryQueue() {
       console.log(`[bg] ✅ Queued ${payload.eventType} sent successfully`);
       
     } catch (error) {
-      // Put it back in queue
       eventQueue.unshift(payload);
       break;
     }
 
-    // Small delay between retries
     await new Promise(resolve => setTimeout(resolve, 100));
   }
 
   isProcessingQueue = false;
 }
 
+// Enhanced session management
 function ensureSession(tabId, url) {
   const problemId = extractProblemId(url);
   
@@ -166,6 +176,7 @@ function ensureSession(tabId, url) {
     currentCode: null,
     currentLanguage: null,
     codeHistory: [],
+    processedSubmissions: [], // Track processed submissions to prevent duplicates
     lastCodeSnapshot: null
   };
   
@@ -174,6 +185,7 @@ function ensureSession(tabId, url) {
   return session;
 }
 
+// Active time tracking
 function updateActiveTime(tabId) {
   const session = sessions.get(tabId);
   if (!session || !session.isActive || !session.focused) return;
@@ -186,6 +198,7 @@ function updateActiveTime(tabId) {
   session.lastActivity = now;
 }
 
+// Focus management
 function setSessionFocus(tabId, focused) {
   const session = sessions.get(tabId);
   if (!session) return;
@@ -196,15 +209,23 @@ function setSessionFocus(tabId, focused) {
   console.log(`[bg] Session ${tabId} focus: ${focused}`);
 }
 
-async function fetchRecentSubmissions(limit = 10) {
+// Fetch recent submissions from API
+async function fetchRecentSubmissions(limit = 15) {
   if (!settings.leetcodeUsername) {
+    console.log('[bg] No LeetCode username configured');
     return [];
   }
   
   try {
-    const response = await fetch(`${settings.alfaApiBase}/${settings.leetcodeUsername}/submission?limit=${limit}`);
+    const url = `${settings.alfaApiBase}/${settings.leetcodeUsername}/submission?limit=${limit}`;
+    console.log(`[bg] Fetching submissions from: ${url}`);
+    
+    const response = await fetch(url);
     if (!response.ok) throw new Error(`API error: ${response.status}`);
+    
     const data = await response.json();
+    console.log(`[bg] API Response:`, data);
+    
     return data.submission || [];
   } catch (error) {
     console.warn("[bg] Failed to fetch submissions:", error.message);
@@ -212,26 +233,128 @@ async function fetchRecentSubmissions(limit = 10) {
   }
 }
 
-async function checkForNewSubmission(session, sinceTime) {
-  const submissions = await fetchRecentSubmissions(15);
+// Simplified submission detection - just check recent submissions for matches
+async function checkForNewSubmissions(session) {
+  console.log(`[bg] 🔍 Checking recent submissions for problem: ${session.problemId}`);
   
-  const recentForProblem = submissions.filter(sub => {
-    const subTime = new Date(sub.timestamp).getTime();
-    const titleSlug = sub.title.toLowerCase().replace(/\s+/g, '-');
+  try {
+    const submissions = await fetchRecentSubmissions(20);
     
-    return titleSlug === session.problemId &&
-           subTime >= sinceTime &&
-           subTime <= Date.now() + 60000;
-  });
+    if (!submissions || submissions.length === 0) {
+      console.log('[bg] No submissions returned from API');
+      return;
+    }
 
-  return recentForProblem.length > 0 ? recentForProblem[0] : null;
+    console.log(`[bg] Found ${submissions.length} total recent submissions`);
+
+    // Simple logic: Check if any recent submission matches current problem
+    const matchingSubmissions = submissions.filter(sub => {
+      const titleSlug = sub.title.toLowerCase().replace(/\s+/g, '-');
+      const isMatch = titleSlug === session.problemId;
+      
+      console.log(`[bg] "${sub.title}" → "${titleSlug}" vs "${session.problemId}" | Match: ${isMatch}`);
+      
+      return isMatch;
+    });
+
+    console.log(`[bg] Found ${matchingSubmissions.length} matching submissions`);
+
+    // Process each matching submission (avoid duplicates)
+    for (const submission of matchingSubmissions) {
+      const submissionKey = `${session.problemId}_${submission.id}`;
+      
+      // Skip if already processed
+      if (session.processedSubmissions.includes(submissionKey)) {
+        console.log(`[bg] ⚠️ Already processed: ${submissionKey}`);
+        continue;
+      }
+
+      // Mark as processed
+      session.processedSubmissions.push(submissionKey);
+      
+      // Keep list manageable (last 50)
+      if (session.processedSubmissions.length > 50) {
+        session.processedSubmissions = session.processedSubmissions.slice(-25);
+      }
+
+      console.log(`[bg] 🎯 NEW SUBMISSION FOUND: ${submission.statusDisplay} for ${submission.title}`);
+
+      // Send submission event
+      await postEvent("ProblemSubmitted", {
+        userId: settings.userId,
+        platform: session.platform,
+        problemId: session.problemId,
+        problemTitle: session.problemTitle || submission.title,
+        verdict: submission.statusDisplay,
+        runtime: submission.runtime || null,
+        memory: submission.memory || null,
+        language: submission.lang || null,
+        submissionId: submission.id,
+        timestamp: submission.timestamp, // Keep original timestamp
+        code: session.currentCode,
+        ts: Date.now()
+      });
+    }
+
+  } catch (error) {
+    console.error('[bg] Error checking submissions:', error);
+  }
 }
 
+// OPTIMIZED HEARTBEAT SYSTEM - Separated intervals
+// Enhanced heartbeat system with simplified submission detection
+setInterval(async () => {
+  const now = Date.now();
+  
+  for (const [tabId, session] of sessions) {
+    if (!session.isActive) continue;
+    
+    updateActiveTime(tabId);
+    
+    // REGULAR HEARTBEAT - Every 30 seconds
+    if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+      await postEvent("ProblemProgress", {
+        userId: settings.userId,
+        platform: session.platform,
+        problemId: session.problemId,
+        activeMs: session.activeMs,
+        wallClockMs: now - session.startTime,
+        counters: session.counters,
+        focused: session.focused,
+        currentCode: session.currentCode,
+        currentLanguage: session.currentLanguage,
+        codeStats: session.currentCode ? {
+          lines: session.currentCode.split('\n').length,
+          chars: session.currentCode.length,
+          words: session.currentCode.trim().split(/\s+/).length
+        } : null,
+        ts: now
+      });
+    }
+    
+    // SUBMISSION CHECK - Every 5 minutes (simplified!)
+    if (settings.leetcodeUsername && now - lastSubmissionCheck >= SUBMISSION_CHECK_INTERVAL) {
+      await checkForNewSubmissions(session); // No timestamp needed!
+    }
+  }
+  
+  // Update global timers
+  if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    lastHeartbeat = now;
+  }
+  if (now - lastSubmissionCheck >= SUBMISSION_CHECK_INTERVAL) {
+    lastSubmissionCheck = now;
+  }
+  
+}, 5000);
+
+// Enhanced problem detection
 async function detectProblem({ problemTitle, problemUrl }) {
   const problemId = extractProblemId(problemUrl);
   return { problemId, expectedTime: 1800 };
 }
 
+// Session termination
 async function endSession(tabId, reason = 'unknown') {
   const session = sessions.get(tabId);
   if (!session) return;
@@ -257,66 +380,7 @@ async function endSession(tabId, reason = 'unknown') {
   console.log(`[bg] Session ended for tab ${tabId}, reason: ${reason}`);
 }
 
-// Enhanced heartbeat system
-setInterval(async () => {
-  const now = Date.now();
-  for (const [tabId, session] of sessions) {
-    if (!session.isActive) continue;
-    
-    updateActiveTime(tabId);
-    
-    // Check for submissions
-    if (settings.leetcodeUsername && now - session.lastSubmissionCheck > 30000) {
-      session.lastSubmissionCheck = now;
-      const checkSince = now - (2 * 60 * 1000);
-      
-      const newSubmission = await checkForNewSubmission(session, checkSince);
-      if (newSubmission) {
-        console.log(`[bg] Found new submission via API:`, newSubmission.statusDisplay);
-        
-        await postEvent("ProblemSubmitted", {
-          userId: settings.userId,
-          platform: session.platform,
-          problemId: session.problemId,
-          problemTitle: session.problemTitle,
-          verdict: newSubmission.statusDisplay,
-          runtime: newSubmission.runtime || null,
-          memory: newSubmission.memory || null,
-          language: newSubmission.lang || null,
-          submissionId: newSubmission.id,
-          timestamp: newSubmission.timestamp,
-          code: session.currentCode,
-          ts: now
-        });
-      }
-    }
-    
-    // Regular heartbeat
-    if (now - session.lastHeartbeat >= settings.heartbeatIntervalMs) {
-      session.lastHeartbeat = now;
-      
-      await postEvent("ProblemProgress", {
-        userId: settings.userId,
-        platform: session.platform,
-        problemId: session.problemId,
-        activeMs: session.activeMs,
-        wallClockMs: now - session.startTime,
-        counters: session.counters,
-        focused: session.focused,
-        currentCode: session.currentCode,
-        currentLanguage: session.currentLanguage,
-        codeStats: session.currentCode ? {
-          lines: session.currentCode.split('\n').length,
-          chars: session.currentCode.length,
-          words: session.currentCode.trim().split(/\s+/).length
-        } : null,
-        ts: now
-      });
-    }
-  }
-}, 5000);
-
-// Message handlers (same as before but using postEvent function)
+// Enhanced message handlers
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender?.tab?.id ?? null;
 
@@ -447,31 +511,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ts: Date.now()
       });
 
+      // Immediate submission checks after submit button (independent of 5-min interval)
+      console.log('[bg] 🚀 Submit button clicked - starting immediate submission checks');
+      
+      // First check after 10 seconds
       setTimeout(async () => {
-        const newSubmission = await checkForNewSubmission(s, s.lastSubmissionTime - 5000);
-        if (newSubmission) {
-          await postEvent("ProblemSubmitted", {
-            userId: settings.userId,
-            platform: s.platform,
-            problemId: s.problemId,
-            problemTitle: s.problemTitle,
-            verdict: newSubmission.statusDisplay,
-            runtime: newSubmission.runtime || null,
-            memory: newSubmission.memory || null,
-            language: newSubmission.lang || null,
-            submissionId: newSubmission.id,
-            timestamp: newSubmission.timestamp,
-            code: s.currentCode,
-            ts: Date.now()
-          });
-        }
-      }, 15000);
+        console.log('[bg] First immediate submission check');
+        await checkForNewSubmissions(s, s.lastSubmissionTime - 5000);
+      }, 10000);
+      
+      // Second check after 30 seconds
+      setTimeout(async () => {
+        console.log('[bg] Second immediate submission check');
+        await checkForNewSubmissions(s, s.lastSubmissionTime - 5000);
+      }, 30000);
+      
+      // Third check after 60 seconds
+      setTimeout(async () => {
+        console.log('[bg] Third immediate submission check');
+        await checkForNewSubmissions(s, s.lastSubmissionTime - 5000);
+      }, 60000);
+      
     })();
     return;
   }
 });
 
-// Tab lifecycle handlers remain the same...
+// Tab lifecycle management
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (sessions.has(tabId)) {
     endSession(tabId, 'tab_closed');
@@ -493,3 +559,6 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
     setSessionFocus(id, id === tabId);
   }
 });
+
+console.log('[bg] 🚀 LeetCode Session Tracker service worker initialized');
+console.log('[bg] ⏱️ Heartbeat interval: 30s | Submission check interval: 5min');
